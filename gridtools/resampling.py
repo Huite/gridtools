@@ -8,6 +8,7 @@ from numba import jit
 US_NEAREST = 10
 #: Interpolation method for upsampling: Bi-linear interpolation between the 4 nearest source grid cells.
 US_LINEAR = 11
+US_LINEAR_MIDPOINT = 12
 
 #: Aggregation method for downsampling: Take first valid source grid cell, ignore contribution areas.
 DS_FIRST = 50
@@ -71,7 +72,7 @@ def resample_2d(src, w, h, ds_method=DS_MEAN, us_method=US_LINEAR, fill_value=No
                         src, fill_value)
 
 
-def upsample_2d(src, w, h, method=US_LINEAR, fill_value=None, out=None):
+def upsample_2d(src, w, h, method=US_LINEAR, fill_value=None, out=None, src_transform=None, out_transform=None):
     """
     Upsample a 2-D grid to a higher resolution by interpolating original grid cells.
 
@@ -89,14 +90,35 @@ def upsample_2d(src, w, h, method=US_LINEAR, fill_value=None, out=None):
     :param out: 2-D *ndarray*, optional
         Alternate output array in which to place the result. The default is *None*; if provided, it must have the same
         shape as the expected output.
+    :param src_transform: *affine* transform, optional
+        Affine object containing (width of pixel, row rotation, upper left x-coordinate, column rotation, height of 
+        pixel, upper left y-coordinate) of the src array. Column and row rotation are not supported.
+    :param out_transform: *affine* transform, optional
+        Affine object containing (width of pixel, row rotation, upper left x-coordinate, column rotation, height of 
+        pixel, upper left y-coordinate) of the out array. Column and row rotation are not supported.
     :return: An upsampled version of the *src* array.
     """
     out = _get_out(out, src, (h, w))
+    
+    if (src_transform is None) ^ (out_transform is None):
+        raise ValueError("Either no transform should be given, or both")
+    elif src_transform is not None and out_transform is not None:
+        src_transform, out_transform = _check_transform(src_transform, out_transform, src, out)
+        src_dx, src_dy = src_transform[0], src_transform[4]
+        out_dx, out_dy = out_transform[0], out_transform[4]
+        if abs(out_dx) > abs(src_dx) or abs(out_dy) > abs(src_dy):
+            raise ValueError("Invalid cellsize in 'out_transform'")
+        use_transform = True
+    else:
+        src_transform = np.zeros(6,)
+        out_transform = np.zeros(6,)
+        use_transform = False
+    
     if out is None:
         return src
     mask, use_mask = _get_mask(src)
     fill_value = _get_fill_value(fill_value, src, out)
-    return _mask_or_not(_upsample_2d(src, mask, use_mask, method, fill_value, out), src, fill_value)
+    return _mask_or_not(_upsample_2d(src, mask, use_mask, method, fill_value, out, use_transform, src_transform, out_transform), src, fill_value)
 
 
 def downsample_2d(src, w, h, method=DS_MEAN, fill_value=None, mode_rank=1, out=None, src_transform=None, out_transform=None):
@@ -263,25 +285,35 @@ def _resample_2d(src, mask, use_mask, ds_method, us_method, fill_value, mode_ran
 # Key-value args are not allowed.
 #
 @jit(nopython=True)
-def _upsample_2d(src, mask, use_mask, method, fill_value, out):
+def _upsample_2d(src, mask, use_mask, method, fill_value, out, use_transform=False, src_transform=np.zeros((6,)), out_transform=np.zeros((6,))):
     src_w = src.shape[-1]
     src_h = src.shape[-2]
     out_w = out.shape[-1]
     out_h = out.shape[-2]
 
-    if src_w == out_w and src_h == out_h:
-        return src
-
-    if out_w < src_w or out_h < src_h:
-        raise ValueError("invalid target size")
+    if use_transform:
+        src_dx, _, src_xcov0, _, src_dy, src_ycov0 = src_transform
+        out_dx, _, out_xcov0, _, out_dy, out_ycov0 = out_transform
+        scale_x = out_dx / src_dx
+        scale_y = out_dy / src_dy
+        x_offset = (out_xcov0 - src_xcov0) / src_dx
+        y_offset = (out_ycov0 - src_ycov0) / src_dy
+    else:
+        if src_w == out_w and src_h == out_h:
+            return src
+        if out_w < src_w or out_h < src_h:
+            raise ValueError("invalid target size")
+        x_offset = 0.0
+        y_offset = 0.0
 
     if method == US_NEAREST:
-        scale_x = src_w / out_w
-        scale_y = src_h / out_h
+        if not use_transform:
+            scale_x = src_w / out_w
+            scale_y = src_h / out_h
         for out_y in range(out_h):
-            src_y = int(scale_y * out_y)
+            src_y = int(y_offset + scale_y * out_y)
             for out_x in range(out_w):
-                src_x = int(scale_x * out_x)
+                src_x = int(x_offset + scale_x * out_x)
                 value = src[src_y, src_x]
                 if np.isfinite(value) and not (use_mask and mask[src_y, src_x]):
                     out[out_y, out_x] = value
@@ -289,17 +321,18 @@ def _upsample_2d(src, mask, use_mask, method, fill_value, out):
                     out[out_y, out_x] = fill_value
 
     elif method == US_LINEAR:
-        scale_x = (src_w - 1.0) / ((out_w - 1.0) if out_w > 1 else 1.0)
-        scale_y = (src_h - 1.0) / ((out_h - 1.0) if out_h > 1 else 1.0)
+        if not use_transform:
+            scale_x = (src_w - 1.0) / ((out_w - 1.0) if out_w > 1 else 1.0)
+            scale_y = (src_h - 1.0) / ((out_h - 1.0) if out_h > 1 else 1.0)
         for out_y in range(out_h):
-            src_yf = scale_y * out_y
+            src_yf = y_offset + scale_y * out_y
             src_y0 = int(src_yf)
             wy = src_yf - src_y0
             src_y1 = src_y0 + 1
             if src_y1 >= src_h:
                 src_y1 = src_y0
             for out_x in range(out_w):
-                src_xf = scale_x * out_x
+                src_xf = x_offset + scale_x * out_x
                 src_x0 = int(src_xf)
                 wx = src_xf - src_x0
                 src_x1 = src_x0 + 1
@@ -345,6 +378,79 @@ def _upsample_2d(src, mask, use_mask, method, fill_value, out):
                 else:
                     out[out_y, out_x] = fill_value
 
+    elif method == US_LINEAR_MIDPOINT:
+        if not use_transform:
+            scale_x = src_w / out_w
+            scale_y = src_h / out_h
+        for out_y in range(out_h):
+            src_yf = y_offset + scale_y * out_y
+            src_y0 = int(src_yf)
+            wy = (src_yf - src_y0 - 0.5) + 0.5 * scale_y
+            if wy < 0:
+                if src_y0 > 0:
+                    wy = 1.0 + wy
+                    src_y1 = src_y0
+                    src_y0 -= 1
+                else:
+                    src_y1 = src_y0
+            else:
+                src_y1 = src_y0 + 1
+            if src_y1 >= src_h:
+                src_y1 = src_y0
+            for out_x in range(out_w):
+                src_xf = x_offset + scale_x * out_x
+                src_x0 = int(src_xf)
+                wx = (src_xf - src_x0 - 0.5) + 0.5 * scale_x 
+                if wx < 0:
+                    if src_x0 > 0:
+                        wx = 1.0 + wx
+                        src_x1 = src_x0
+                        src_x0 -= 1
+                    else:
+                        src_x1 = src_x0
+                else:
+                    src_x1 = src_x0 + 1
+                if src_x1 >= src_w:
+                    src_x1 = src_x0
+                v00 = src[src_y0, src_x0]
+                v01 = src[src_y0, src_x1]
+                v10 = src[src_y1, src_x0]
+                v11 = src[src_y1, src_x1]
+                if use_mask:
+                    v00_ok = np.isfinite(v00) and not mask[src_y0, src_x0]
+                    v01_ok = np.isfinite(v01) and not mask[src_y0, src_x1]
+                    v10_ok = np.isfinite(v10) and not mask[src_y1, src_x0]
+                    v11_ok = np.isfinite(v11) and not mask[src_y1, src_x1]
+                else:
+                    v00_ok = np.isfinite(v00)
+                    v01_ok = np.isfinite(v01)
+                    v10_ok = np.isfinite(v10)
+                    v11_ok = np.isfinite(v11)
+                if v00_ok and v01_ok and v10_ok and v11_ok:
+                    ok = True
+                    v0 = v00 + wx * (v01 - v00)
+                    v1 = v10 + wx * (v11 - v10)
+                    value = v0 + wy * (v1 - v0)
+                elif wx < 0.5:
+                    # NEAREST according to weight
+                    if wy < 0.5:
+                        ok = v00_ok
+                        value = v00
+                    else:
+                        ok = v10_ok
+                        value = v10
+                else:
+                    # NEAREST according to weight
+                    if wy < 0.5:
+                        ok = v01_ok
+                        value = v01
+                    else:
+                        ok = v11_ok
+                        value = v11
+                if ok:
+                    out[out_y, out_x] = value
+                else:
+                    out[out_y, out_x] = fill_value
     else:
         raise ValueError('invalid upsampling method')
 
